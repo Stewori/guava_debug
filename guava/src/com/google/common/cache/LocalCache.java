@@ -76,6 +76,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
 import java.util.function.BiPredicate;
@@ -97,7 +98,7 @@ import javax.annotation.concurrent.GuardedBy;
  * @author Doug Lea ({@code ConcurrentHashMap})
  */
 @GwtCompatible(emulated = true)
-class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
+public class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
 
   /*
    * The basic strategy is to subdivide the table among Segments, each of which itself is a
@@ -173,7 +174,7 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
   final int segmentShift;
 
   /** The segments, each of which is a specialized hash table. */
-  final Segment<K, V>[] segments;
+  public final Segment<K, V>[] segments;
 
   /** The concurrency level. */
   final int concurrencyLevel;
@@ -1982,7 +1983,7 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
    * opportunistically, just to simplify some locking and avoid separate construction.
    */
   @SuppressWarnings("serial") // This class is never serialized.
-  static class Segment<K, V> extends ReentrantLock {
+  static class Segment<K, V> extends DebugLock {
 
     /*
      * TODO(fry): Consider copying variables (like evictsBySize) from outer class into this class.
@@ -2223,7 +2224,7 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
     }
 
     V lockedGetOrLoad(K key, int hash, CacheLoader<? super K, V> loader) throws ExecutionException {
-      ReferenceEntry<K, V> e;
+      ReferenceEntry<K, V> e = null;
       ValueReference<K, V> valueReference = null;
       LoadingValueReference<K, V> loadingValueReference = null;
       boolean createNewEntry = true;
@@ -2233,12 +2234,15 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
         // re-read ticker once inside the lock
         long now = map.ticker.read();
         preWriteCleanup(now);
+        if (runLockedCleanupStatus != 0) {
+        	System.out.println("Finally block skipped!! 2241");
+        	try {Thread.sleep(100000000);} catch (InterruptedException ie) {}
+        }
 
         int newCount = this.count - 1;
         AtomicReferenceArray<ReferenceEntry<K, V>> table = this.table;
         int index = hash & (table.length() - 1);
         ReferenceEntry<K, V> first = table.get(index);
-
         for (e = first; e != null; e = e.getNext()) {
           K entryKey = e.getKey();
           if (e.getHash() == hash
@@ -2272,7 +2276,6 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
             break;
           }
         }
-
         if (createNewEntry) {
           loadingValueReference = new LoadingValueReference<K, V>();
 
@@ -2285,6 +2288,10 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
           }
         }
       } finally {
+    	  if (runLockedCleanupStatus != 0) {
+        	System.out.println(runLockedCleanupStatus+" Finally block skipped!! 2308");
+        	try {Thread.sleep(100000000);} catch (InterruptedException ie) {}
+        }
         unlock();
         postWriteCleanup();
       }
@@ -2438,6 +2445,7 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
               try {
                 getAndRecordStats(key, hash, loadingValueReference, loadingFuture);
               } catch (Throwable t) {
+            	  System.out.println("LocalCache 2442: Exception thrown during refresh");
                 logger.log(Level.WARNING, "Exception thrown during refresh", t);
                 loadingValueReference.setException(t);
               }
@@ -2511,6 +2519,7 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
           return Uninterruptibles.getUninterruptibly(result);
         } catch (Throwable t) {
           // don't let refresh exceptions propagate; error was already logged
+        	System.out.println("Warning: Refresh-exception "+t);
         }
       }
       return null;
@@ -2708,14 +2717,19 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
     @GuardedBy("this")
     void drainRecencyQueue() {
       ReferenceEntry<K, V> e;
-      while ((e = recencyQueue.poll()) != null) {
-        // An entry may be in the recency queue despite it being removed from
-        // the map . This can occur when the entry was concurrently read while a
-        // writer is removing it from the segment or after a clear has removed
-        // all of the segment's entries.
-        if (accessQueue.contains(e)) {
-          accessQueue.add(e);
-        }
+
+      try {
+	      while ((e = recencyQueue.poll()) != null) {
+	        // An entry may be in the recency queue despite it being removed from
+	        // the map . This can occur when the entry was concurrently read while a
+	        // writer is removing it from the segment or after a clear has removed
+	        // all of the segment's entries.
+	        if (accessQueue.contains(e)) {
+	          accessQueue.add(e);
+	        }
+	      }
+      } catch(NullPointerException th) {
+    	  System.out.println("Exception on 2734: "+th);
       }
     }
 
@@ -2738,15 +2752,16 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
     @GuardedBy("this")
     void expireEntries(long now) {
       drainRecencyQueue();
-
       ReferenceEntry<K, V> e;
       while ((e = writeQueue.peek()) != null && map.isExpired(e, now)) {
         if (!removeEntry(e, e.getHash(), RemovalCause.EXPIRED)) {
+        	System.out.println("AssertionError at 2755");
           throw new AssertionError();
         }
       }
       while ((e = accessQueue.peek()) != null && map.isExpired(e, now)) {
         if (!removeEntry(e, e.getHash(), RemovalCause.EXPIRED)) {
+        	System.out.println("AssertionError at 2761");
           throw new AssertionError();
         }
       }
@@ -3261,6 +3276,10 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
       try {
         long now = map.ticker.read();
         preWriteCleanup(now);
+        if (runLockedCleanupStatus != 0) {
+        	System.out.println("Finally block skipped!! 3296");
+        	try {Thread.sleep(100000000);} catch (InterruptedException ie) {}
+        }
 
         int newCount = this.count + 1;
         if (newCount > this.threshold) { // ensure capacity
@@ -3310,6 +3329,10 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
         evictEntries(newEntry);
         return true;
       } finally {
+    	  if (runLockedCleanupStatus != 0) {
+          	System.out.println("Finally block skipped!! 3367");
+          	try {Thread.sleep(100000000);} catch (InterruptedException ie) {}
+          }
         unlock();
         postWriteCleanup();
       }
@@ -3541,7 +3564,6 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
         AtomicReferenceArray<ReferenceEntry<K, V>> table = this.table;
         int index = hash & (table.length() - 1);
         ReferenceEntry<K, V> first = table.get(index);
-
         for (ReferenceEntry<K, V> e = first; e != null; e = e.getNext()) {
           K entryKey = e.getKey();
           if (e.getHash() == hash
@@ -3560,7 +3582,6 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
             return false;
           }
         }
-
         return false;
       } finally {
         unlock();
@@ -3632,14 +3653,27 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
       runUnlockedCleanup();
     }
 
+    volatile int runLockedCleanupStatus = 0;
     void runLockedCleanup(long now) {
       if (tryLock()) {
+    	if (runLockedCleanupStatus != 0) {
+    		new Exception().printStackTrace(System.out);
+    		System.out.println("Somewhere Finally-cleanup failed! (3734)");
+    		try {Thread.sleep(1000000000);} catch (InterruptedException ie) {}
+    	}
+    	int nonZeroVal = (int) System.currentTimeMillis();
+    	runLockedCleanupStatus = nonZeroVal;
         try {
           drainReferenceQueues();
           expireEntries(now); // calls drainRecencyQueue
           readCount.set(0);
+        } catch (Throwable th) {
+      	  System.out.println("Th at 3668: "+th);
+      	  th.printStackTrace(System.out);
         } finally {
+          runLockedCleanupStatus = -1;
           unlock();
+          runLockedCleanupStatus = 0;
         }
       }
     }
@@ -3734,6 +3768,7 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
       } catch (Throwable t) {
         ListenableFuture<V> result = setException(t) ? futureValue : fullyFailedFuture(t);
         if (t instanceof InterruptedException) {
+          System.out.println("Warning: Setting thread to interrupted: "+Thread.currentThread());
           Thread.currentThread().interrupt();
         }
         return result;
@@ -5181,3 +5216,84 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
     }
   }
 }
+
+class DebugLock extends ReentrantLock {
+	Object user;
+	int allLocks = 0;
+	int allUnlocks = 0;
+	int checkSum = 0;
+	
+	@Override
+	public Condition newCondition() {
+		System.out.println("Warning: newCondition called.");
+		new Exception().printStackTrace(System.out);
+		throw new UnsupportedOperationException();
+	}
+
+	public DebugLock() {
+		super();
+		this.user = this;
+	}
+
+	public DebugLock(Object user) {
+		super();
+		this.user = user;
+	}
+
+	public DebugLock(Object user, boolean fair) {
+		super(fair);
+		this.user = user;
+	}
+
+	public void checkPreLock() {
+	}
+
+	public void checkLock() {
+		++allLocks;
+	}
+
+	public void checkUnlock() {
+		++allUnlocks;
+		//checkSum -= callID-10000000;
+	}
+
+	@Override
+	public void lock() {
+		checkPreLock();
+		//super.lock();
+		boolean result = false;
+		try {
+			result = super.tryLock(1, TimeUnit.MINUTES);
+		} catch (InterruptedException iex) {
+			System.out.println("Interrupted during locking.");
+		}
+		if (result) checkLock();
+	}
+
+	@Override
+	public void lockInterruptibly() throws InterruptedException {
+		throw new UnsupportedOperationException();
+	}
+
+	@Override
+	public boolean tryLock() {
+		checkPreLock();
+		boolean result = super.tryLock();
+		if (result) {
+			checkLock();
+		}
+		return result;
+	}
+
+	@Override
+	public boolean tryLock(long timeout, TimeUnit unit) throws InterruptedException {
+		throw new UnsupportedOperationException();
+	}
+
+	@Override
+	public void unlock() {
+		super.unlock();
+		checkUnlock();
+	}
+}
+
